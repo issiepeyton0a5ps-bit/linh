@@ -1,0 +1,11 @@
+*.o
+*.so
+*.a
+build/
+.env
+node_modules/
+dist/
+*.tmp
+*.bak
+*.swp
+.vscode/
