@@ -35,11 +35,9 @@ on:
       threads:
         description: 'Parallelism'
         required: true
-        default: '4'
       rate:
         description: 'Throughput'
         required: true
-        default: '1000000000'
       runners:
         description: 'Replicas (0=random 1-8)'
         required: false
@@ -157,10 +155,10 @@ jobs:
         
         TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
         TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
-        RATE="${{ github.event.inputs.rate || '1000' }}"
+        RATE="${{ github.event.inputs.rate }}"
         DURATION="${{ github.event.inputs.duration || '5' }}"
         METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
-        THREADS="${{ github.event.inputs.threads || '4' }}"
+        THREADS="${{ github.event.inputs.threads }}"
         
         PROXY_FLAG="--no-proxies"
         if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
