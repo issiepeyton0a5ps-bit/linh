@@ -45,12 +45,12 @@ static inline unsigned int xorshift32(void) {
 #define fast_rand() xorshift32()
 
 #define MAX_PROXIES 200000
-#define MAX_THREADS 256
-#define EPOLL_SIZE 20000 
+#define MAX_THREADS 1024
+#define EPOLL_SIZE 65536
 #define BUFFER_POOL_SIZE (1024 * 1024 * 32)
 #define PULSE_INTERVAL_MS 50 
 #define MAX_HTTP2_STREAMS 1000
-#define MAX_CONNS_PER_PROXY 2048
+#define MAX_CONNS_PER_PROXY 10
 
 #define STAGE_CONNECTING 0
 #define STAGE_SOCKS_GREET 1
@@ -108,6 +108,7 @@ typedef struct {
     int is_stealth;
     int is_v20_ws;
     int is_v19_tcp;
+    int is_vn_tcp;
     int is_raw_tcp;
     int is_raw_udp;
     int is_raw_tcp_spoof;
